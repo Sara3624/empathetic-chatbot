@@ -98,8 +98,15 @@ class TransformerChat(nn.Module):
 # ---- load tokenizer & model ----
 sp = spm.SentencePieceProcessor(model_file="spm.model")
 model = TransformerChat()
-model.load_state_dict(torch.load("model.pt", map_location="cpu"))
+
+state = torch.load("model.pt", map_location="cpu")
+missing, unexpected = model.load_state_dict(state, strict=False)
+
+print("⚠️ Missing keys:", missing)
+print("⚠️ Unexpected keys:", unexpected)
+
 model.eval()
+
 
 def encode_str(s, add_bos=False, add_eos=False, max_len=128):
     ids=sp.encode(s,out_type=int)
