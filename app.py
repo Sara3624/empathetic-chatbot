@@ -8,7 +8,7 @@ import sentencepiece as spm
 import math, json, os
 from torch import nn
 
-# ==== Load config.json to ensure matching hyperparameters ====
+# ==== Load config.json to match Kaggle training exactly ====
 if os.path.exists("config.json"):
     with open("config.json") as f:
         cfg = json.load(f)
@@ -17,7 +17,7 @@ if os.path.exists("config.json"):
     MAX_LEN_IN, MAX_LEN_OUT = cfg["MAX_LEN_IN"], cfg["MAX_LEN_OUT"]
     D_MODEL, HEADS, N_ENC, N_DEC, D_FF = cfg["D_MODEL"], cfg["HEADS"], cfg["N_ENC"], cfg["N_DEC"], cfg["D_FF"]
 else:
-    # fallback (in case config.json missing)
+    # Fallback in case config.json missing
     PAD_ID, BOS_ID, EOS_ID = 5, 3, 4
     VOCAB_SIZE = 16000
     MAX_LEN_IN, MAX_LEN_OUT = 128, 64
@@ -25,7 +25,7 @@ else:
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ==== Model Architecture (identical to training) ====
+# ==== Transformer Architecture (must be identical to Kaggle training) ====
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=2048):
         super().__init__()
@@ -34,15 +34,13 @@ class PositionalEncoding(nn.Module):
         div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
         pe[:, 0::2], pe[:, 1::2] = torch.sin(pos * div), torch.cos(pos * div)
         self.register_buffer("pe", pe.unsqueeze(0))
-    def forward(self, x):
-        return x + self.pe[:, :x.size(1)]
+    def forward(self, x): return x + self.pe[:, :x.size(1)]
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, d_model=D_MODEL, heads=HEADS, dropout=0.1):
         super().__init__()
         self.h, self.d_k = heads, d_model // heads
-        self.q, self.k, self.v = [nn.Linear(d_model, d_model) for _ in range(3)]
-        self.q, self.k, self.v = nn.Linear(d_model,d_model), nn.Linear(d_model,d_model), nn.Linear(d_model,d_model)
+        self.q, self.k, self.v = nn.Linear(d_model, d_model), nn.Linear(d_model, d_model), nn.Linear(d_model, d_model)
         self.o = nn.Linear(d_model, d_model)
         self.drop = nn.Dropout(dropout)
     def forward(self, q, k, v, mask=None):
@@ -52,7 +50,8 @@ class MultiHeadAttention(nn.Module):
         k = self.k(k).view(B, -1, h, dk).transpose(1, 2)
         v = self.v(v).view(B, -1, h, dk).transpose(1, 2)
         scores = (q @ k.transpose(-2, -1)) / math.sqrt(dk)
-        if mask is not None: scores = scores.masked_fill(mask, float("-inf"))
+        if mask is not None:
+            scores = scores.masked_fill(mask, float("-inf"))
         attn = self.drop(F.softmax(scores, dim=-1))
         out = (attn @ v).transpose(1, 2).contiguous().view(B, Tq, h * dk)
         return self.o(out)
@@ -115,7 +114,7 @@ class TransformerChat(nn.Module):
         for l in self.decs: y = l(y, mem, tmask, spad)
         return self.out(self.lnD(y))
 
-# ==== Load Tokenizer & Model ====
+# ==== Load tokenizer & model ====
 sp = spm.SentencePieceProcessor(model_file="spm.model")
 model = TransformerChat().to(DEVICE)
 state = torch.load("model.pt", map_location=DEVICE)
@@ -141,44 +140,60 @@ def clean_text(text):
     words = text.split()
     seen = []
     for w in words:
-        if len(seen) >= 2 and w == seen[-1] == seen[-2]: continue
+        if len(seen) >= 2 and w == seen[-1] == seen[-2]:
+            continue
         seen.append(w)
-    text = " ".join(seen)
-    return text[:500]
+    return " ".join(seen)
 
-# ==== Nucleus Sampling Decoding ====
+# ==== Greedy Decoding ====
 @torch.no_grad()
-def sample_text(model, x_text, top_p=0.9, temperature=1.0, max_len=MAX_LEN_OUT):
+def greedy_text(model, x_text, max_len=64):
     model.eval()
-    src = torch.tensor([encode_str(x_text, add_bos=True, add_eos=True)], device=DEVICE)
+    src = torch.tensor([encode_str(x_text, add_bos=True, add_eos=True, max_len=MAX_LEN_IN)], device=DEVICE)
     ys = torch.tensor([[BOS_ID]], device=DEVICE)
     for _ in range(max_len):
-        logits = model(src, ys)[:, -1, :] / temperature
-        probs = F.softmax(logits, dim=-1)
-        sorted_probs, sorted_idx = torch.sort(probs, descending=True)
-        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-        cutoff = cumulative_probs > top_p
-        sorted_probs[cutoff] = 0
-        sorted_probs /= sorted_probs.sum()
-        next_token = torch.multinomial(sorted_probs, 1)
-        next_token = sorted_idx.gather(-1, next_token)
-        ys = torch.cat([ys, next_token], dim=1)
-        if next_token.item() == EOS_ID: break
+        logits = model(src, ys)
+        nxt = logits[:, -1, :].argmax(-1, keepdim=True)
+        ys = torch.cat([ys, nxt], dim=1)
+        if nxt.item() == EOS_ID: break
     return clean_text(ids_to_text(ys.squeeze(0).tolist()))
+
+# ==== Beam Search Decoding ====
+@torch.no_grad()
+def beam_text(model, x_text, beam=4, max_len=64, lp_alpha=0.7):
+    model.eval()
+    src = torch.tensor([encode_str(x_text, add_bos=True, add_eos=True, max_len=MAX_LEN_IN)], device=DEVICE)
+    beams = [(torch.tensor([[BOS_ID]], device=DEVICE), 0.0)]
+    for _ in range(max_len):
+        new_beams = []
+        for ys, score in beams:
+            logits = model(src, ys)
+            logp = F.log_softmax(logits[:, -1, :], dim=-1).squeeze(0)
+            topk = torch.topk(logp, beam)
+            for tok, lp in zip(topk.indices, topk.values):
+                ys2 = torch.cat([ys, tok.view(1, 1)], dim=1)
+                new_beams.append((ys2, score + lp.item()))
+        def lp_fn(sc, L): return sc / (((5 + L) ** lp_alpha) / ((5 + 1) ** lp_alpha))
+        beams = sorted(new_beams, key=lambda t: lp_fn(t[1], t[0].size(1)), reverse=True)[:beam]
+        if any(b[0][0, -1].item() == EOS_ID for b in beams): break
+    best = max(beams, key=lambda t: t[1])[0]
+    return clean_text(ids_to_text(best.squeeze(0).tolist()))
 
 # ==== Streamlit UI ====
 st.title("🤖 Empathetic Chatbot (Transformer-from-Scratch)")
-st.caption("Built and trained completely from scratch on the Empathetic Dialogues dataset.")
+st.caption("Built entirely from scratch on the Empathetic Dialogues dataset (same as Kaggle).")
 
 emotion = st.text_input("Emotion", "grateful")
-situation = st.text_input("Situation", "I passed my exam today!")
-customer = st.text_area("Customer Message", "I'm so happy! I studied hard and finally passed.")
-strategy = st.radio("Decoding Strategy", ["Nucleus Sampling", "Beam Search"], horizontal=True)
+situation = st.text_input("Situation", "i passed my exam today")
+customer = st.text_area("Customer Utterance", "i am so happy! i studied so hard and finally passed")
+strategy = st.radio("Decoding Strategy", ["Greedy", "Beam"], horizontal=True)
 
-if st.button("Generate Reply"):
+if st.button("Submit"):
     prompt = f"emotion: {emotion} | situation: {situation} | customer: {customer} agent:"
-    if strategy == "Beam Search":
-        reply = sample_text(model, prompt, top_p=1.0, temperature=1.2)
+    if strategy == "Greedy":
+        reply = greedy_text(model, prompt)
     else:
-        reply = sample_text(model, prompt, top_p=0.9, temperature=1.0)
+        reply = beam_text(model, prompt)
     st.success(reply)
+
+st.caption("Built with ❤️ using Streamlit")
