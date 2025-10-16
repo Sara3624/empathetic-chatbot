@@ -6,7 +6,8 @@ import sentencepiece as spm
 
 PAD_ID, BOS_ID, EOS_ID = 5, 3, 4
 VOCAB_SIZE = 16000
-MAX_LEN_IN, MAX_LEN_OUT = 64
+MAX_LEN_IN, MAX_LEN_OUT = 128, 64
+
 
 class PositionalEncoding(nn.Module):
     def __init__(self,d_model,max_len=2048):
