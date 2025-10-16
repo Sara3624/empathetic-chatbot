@@ -87,7 +87,17 @@ class TransformerChat(nn.Module):
         return self.out(y)
 
 sp=spm.SentencePieceProcessor(model_file='spm.model')
-model=TransformerChat(); model.load_state_dict(torch.load('model.pt',map_location='cpu')); model.eval()
+model = TransformerChat(
+    vocab_size=VOCAB_SIZE,
+    d_model=256,
+    heads=4,
+    n_enc=3,
+    n_dec=3,
+    d_ff=1024,
+    dropout=0.1
+)
+model.load_state_dict(torch.load('model.pt',map_location='cpu'))
+model.eval()
 
 def encode_str(s,add_bos=True,add_eos=True,max_len=MAX_LEN_IN):
     ids=sp.encode(s,out_type=int)
