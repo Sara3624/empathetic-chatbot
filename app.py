@@ -1,4 +1,3 @@
-
 import streamlit as st
 import torch, torch.nn.functional as F, math
 from torch import nn
@@ -127,31 +126,57 @@ def ids_to_text(ids):
     return sp.decode(toks)
 
 @torch.no_grad()
-def generate_reply(emotion, situation, customer):
-    try:
-        x = f"emotion: {emotion} | situation: {situation} | customer: {customer} agent:"
-        src = torch.tensor([encode_str(x)])
-        ys = torch.tensor([[BOS_ID]])
-        for _ in range(MAX_LEN_OUT):
+def generate_greedy(emotion, situation, customer):
+    x = f"emotion: {emotion} | situation: {situation} | customer: {customer} agent:"
+    src = torch.tensor([encode_str(x)])
+    ys = torch.tensor([[BOS_ID]])
+    for _ in range(MAX_LEN_OUT):
+        logits = model(src, ys)
+        nxt = logits[:, -1, :].argmax(-1, keepdim=True)
+        ys = torch.cat([ys, nxt], dim=1)
+        if nxt.item() == EOS_ID: break
+    return ids_to_text(ys.squeeze(0).tolist())
+
+@torch.no_grad()
+def generate_beam(emotion, situation, customer, beam_size=3):
+    x = f"emotion: {emotion} | situation: {situation} | customer: {customer} agent:"
+    src = torch.tensor([encode_str(x)])
+    beams = [(torch.tensor([[BOS_ID]]), 0.0)]  # (sequence, score)
+    for _ in range(MAX_LEN_OUT):
+        new_beams = []
+        for ys, score in beams:
             logits = model(src, ys)
-            nxt = logits[:, -1, :].argmax(-1, keepdim=True)
-            ys = torch.cat([ys, nxt], dim=1)
-            if nxt.item() == EOS_ID: break
-        return ids_to_text(ys.squeeze(0).tolist())
-    except Exception as e:
-        return f"⚠️ Error during generation: {e}"
+            probs = F.log_softmax(logits[:, -1, :], dim=-1)
+            topk = torch.topk(probs, beam_size, dim=-1)
+            for k in range(beam_size):
+                next_tok = topk.indices[0, k].view(1, 1)
+                new_seq = torch.cat([ys, next_tok], dim=1)
+                new_score = score + topk.values[0, k].item()
+                new_beams.append((new_seq, new_score))
+        # keep best beams
+        beams = sorted(new_beams, key=lambda x: x[1], reverse=True)[:beam_size]
+        # stop early if all end
+        if all(seq[0, -1] == EOS_ID for seq, _ in beams): break
+    best_seq = beams[0][0].squeeze(0).tolist()
+    return ids_to_text(best_seq)
 
 # =========================
 # STREAMLIT UI
 # =========================
 st.title("🤖 Empathetic Chatbot (Transformer-from-Scratch)")
-st.markdown("Generate empathetic agent replies based on emotion, situation, and customer message.")
+st.markdown("Compare <b>Greedy</b> vs <b>Beam Search</b> decoding strategies.",
+            unsafe_allow_html=True)
 
 emotion = st.text_input("Emotion", "grateful")
 situation = st.text_input("Situation", "I passed my exam today!")
 customer = st.text_area("Customer Message", "I'm so happy! I studied hard and finally passed.")
 
+decode_type = st.radio("Decoding Strategy", ["Greedy", "Beam Search (Top-3)"])
+
 if st.button("Generate Reply"):
     with st.spinner("Generating empathetic reply..."):
-        response = generate_reply(emotion, situation, customer)
+        if decode_type == "Greedy":
+            response = generate_greedy(emotion, situation, customer)
+        else:
+            response = generate_beam(emotion, situation, customer)
     st.success(response)
